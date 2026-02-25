@@ -1087,6 +1087,11 @@ class CheckIn:
                 session=session,
                 headers=headers,
             )
+            # 直接 HTTP 失败且启用了阿里云验证码时，回退到浏览器方式
+            if not (auth_state_result and auth_state_result.get("success")):
+                if self.provider_config.aliyun_captcha:
+                    print(f"ℹ️ {self.account_name}: Direct auth state request failed, retrying with browser (aliyun captcha)")
+                    auth_state_result = await self.get_auth_state_with_browser()
             if auth_state_result and auth_state_result.get("success"):
                 print(f"ℹ️ {self.account_name}: Got auth state for GitHub: {auth_state_result['state']}")
             else:
@@ -1250,6 +1255,11 @@ class CheckIn:
                 session=session,
                 headers=headers,
             )
+            # 直接 HTTP 失败且启用了阿里云验证码时，回退到浏览器方式
+            if not (auth_state_result and auth_state_result.get("success")):
+                if self.provider_config.aliyun_captcha:
+                    print(f"ℹ️ {self.account_name}: Direct auth state request failed, retrying with browser (aliyun captcha)")
+                    auth_state_result = await self.get_auth_state_with_browser()
             if auth_state_result and auth_state_result.get("success"):
                 print(f"ℹ️ {self.account_name}: Got auth state for Linux.do: {auth_state_result['state']}")
             else:
