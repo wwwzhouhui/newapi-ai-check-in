@@ -472,7 +472,7 @@ class CheckIn:
 
                     # Check if we got a JSON response or an HTML WAF challenge
                     content_type = api_response.headers.get("content-type", "") if api_response else ""
-                    body_text = await page.evaluate("() => document.body.innerText")
+                    body_text = await api_response.text() if api_response else ""
 
                     if "application/json" not in content_type:
                         # Got HTML (likely WAF challenge page), wait for it to auto-resolve
@@ -488,7 +488,7 @@ class CheckIn:
                         # Retry: navigate to auth state URL again
                         print(f"ℹ️ {self.account_name}: Retrying auth state URL after WAF challenge")
                         api_response = await page.goto(auth_state_url, wait_until="networkidle")
-                        body_text = await page.evaluate("() => document.body.innerText")
+                        body_text = await api_response.text() if api_response else ""
 
                     # Parse JSON response
                     try:
