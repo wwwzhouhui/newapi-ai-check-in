@@ -422,9 +422,9 @@ class CheckIn:
             }
 
     async def get_auth_state_with_browser(self) -> dict:
-        """使用 Camoufox 浏览器绕过 WAF 后，通过 curl_cffi 获取认证状态
+        """使用 Camoufox 浏览器绕过 WAF 后获取认证状态
 
-        流程：浏览器访问登录页 → 通过 WAF/验证码 → 提取 cookies → curl_cffi 请求 auth state API
+        流程：浏览器访问登录页 → 通过 WAF/验证码 → 在页面内 fetch auth state API
 
         Returns:
             包含 success、state、cookies 或 error 的字典
@@ -463,24 +463,52 @@ class CheckIn:
                         if captcha_check:
                             await page.wait_for_timeout(3000)
 
-                    # 2. 提取浏览器 cookies（包含 WAF 通行 cookies）
+                    # 2. 在页面内使用 fetch 请求 auth state（与上游项目一致）
+                    # fetch 是同源请求，自动携带 WAF cookies，无指纹不匹配风险
+                    auth_state_url = self.provider_config.get_auth_state_url()
+                    print(f"ℹ️ {self.account_name}: Fetching auth state from page context: {auth_state_url}")
+
+                    response = await page.evaluate(
+                        f"""async () => {{
+                            try {{
+                                const response = await fetch('{auth_state_url}');
+                                const data = await response.json();
+                                return data;
+                            }} catch(e) {{
+                                return {{
+                                    success: false,
+                                    message: e.message
+                                }};
+                            }}
+                        }}"""
+                    )
+
+                    if response and response.get("data"):
+                        cookies = await browser.cookies()
+                        print(f"✅ {self.account_name}: Got auth state via browser fetch")
+                        return {
+                            "success": True,
+                            "state": response.get("data"),
+                            "cookies": cookies,
+                        }
+
+                    # fetch 失败，尝试 curl_cffi 回退
+                    fetch_error = response.get("message", "No data in response") if response else "No response"
+                    print(
+                        f"⚠️ {self.account_name}: Browser fetch failed ({fetch_error}), "
+                        f"trying curl_cffi fallback with browser cookies"
+                    )
+
                     browser_cookies = await browser.cookies()
                     cookie_dict = filter_cookies(browser_cookies, self.provider_config.origin)
 
                     if not cookie_dict:
-                        print(f"⚠️ {self.account_name}: No matching cookies found after WAF bypass")
                         await take_screenshot(page, "no_waf_cookies", self.account_name)
-                        return {"success": False, "error": "No cookies obtained from browser WAF bypass"}
+                        return {"success": False, "error": f"Browser fetch failed: {fetch_error}, no cookies for fallback"}
 
-                    print(
-                        f"ℹ️ {self.account_name}: Got {len(cookie_dict)} cookies from browser, "
-                        f"using curl_cffi for auth state request"
-                    )
-
-                    # 3. 使用 curl_cffi 携带 WAF cookies 请求 auth state API
-                    auth_state_url = self.provider_config.get_auth_state_url()
-                    random_ua = get_random_user_agent()
-                    impersonate = get_curl_cffi_impersonate(random_ua)
+                    # 获取浏览器实际的 User-Agent 保持指纹一致
+                    browser_ua = await page.evaluate("() => navigator.userAgent")
+                    impersonate = get_curl_cffi_impersonate(browser_ua)
                     session = curl_requests.Session(impersonate=impersonate)
 
                     headers = {
@@ -488,7 +516,7 @@ class CheckIn:
                         "Accept-Language": "en,en-US;q=0.9,zh;q=0.8,en-CN;q=0.7,zh-CN;q=0.6",
                         "Cache-Control": "no-store",
                         "Pragma": "no-cache",
-                        "User-Agent": random_ua,
+                        "User-Agent": browser_ua,
                         "Referer": self.provider_config.get_login_url(),
                         "Origin": self.provider_config.origin,
                         "sec-fetch-dest": "empty",
@@ -498,7 +526,7 @@ class CheckIn:
 
                     proxy_url = proxy_resolve(self.camoufox_proxy_config)
 
-                    response = session.get(
+                    http_response = session.get(
                         auth_state_url,
                         headers=headers,
                         cookies=cookie_dict,
@@ -507,31 +535,22 @@ class CheckIn:
                     )
 
                     print(
-                        f"ℹ️ {self.account_name}: Auth state response: "
-                        f"HTTP {response.status_code}, Content-Type: {response.headers.get('content-type', 'N/A')}"
+                        f"ℹ️ {self.account_name}: curl_cffi fallback response: "
+                        f"HTTP {http_response.status_code}, Content-Type: {http_response.headers.get('content-type', 'N/A')}"
                     )
 
-                    if response.status_code == 200:
-                        json_data = response_resolve(response, "get_auth_state_browser", self.account_name)
-                        if json_data is None:
-                            return {
-                                "success": False,
-                                "error": "Failed to get auth state: Invalid response (HTML/non-JSON)",
-                            }
-
-                        if json_data.get("success"):
-                            auth_data = json_data.get("data")
-                            # 返回浏览器 cookies（Camoufox 格式），用于后续 OAuth 流程中设置浏览器上下文
+                    if http_response.status_code == 200:
+                        json_data = response_resolve(http_response, "get_auth_state_browser", self.account_name)
+                        if json_data and json_data.get("success"):
                             return {
                                 "success": True,
-                                "state": auth_data,
+                                "state": json_data.get("data"),
                                 "cookies": browser_cookies,
                             }
-                        else:
-                            error_msg = json_data.get("message", "Unknown error")
-                            return {"success": False, "error": f"Auth state API error: {error_msg}"}
+                        error_msg = json_data.get("message", "Invalid response") if json_data else "Non-JSON response"
+                        return {"success": False, "error": f"curl_cffi fallback failed: {error_msg}"}
                     else:
-                        return {"success": False, "error": f"Auth state request returned HTTP {response.status_code}"}
+                        return {"success": False, "error": f"curl_cffi fallback HTTP {http_response.status_code}"}
 
                 except Exception as e:
                     print(f"❌ {self.account_name}: Failed to get state, {e}")
