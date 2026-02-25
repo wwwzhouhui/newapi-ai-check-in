@@ -479,7 +479,8 @@ class CheckIn:
 
                     # 3. 使用 curl_cffi 携带 WAF cookies 请求 auth state API
                     auth_state_url = self.provider_config.get_auth_state_url()
-                    impersonate = get_curl_cffi_impersonate()
+                    random_ua = get_random_user_agent()
+                    impersonate = get_curl_cffi_impersonate(random_ua)
                     session = curl_requests.Session(impersonate=impersonate)
 
                     headers = {
@@ -487,7 +488,7 @@ class CheckIn:
                         "Accept-Language": "en,en-US;q=0.9,zh;q=0.8,en-CN;q=0.7,zh-CN;q=0.6",
                         "Cache-Control": "no-store",
                         "Pragma": "no-cache",
-                        "User-Agent": get_random_user_agent(),
+                        "User-Agent": random_ua,
                         "Referer": self.provider_config.get_login_url(),
                         "Origin": self.provider_config.origin,
                         "sec-fetch-dest": "empty",
