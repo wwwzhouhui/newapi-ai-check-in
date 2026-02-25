@@ -465,20 +465,38 @@ class CheckIn:
                         if captcha_check:
                             await page.wait_for_timeout(3000)
 
-                    response = await page.evaluate(
-                        f"""async () => {{
-                            try{{
-                                const response = await fetch('{self.provider_config.get_auth_state_url()}');
-                                const data = await response.json();
-                                return data;
-                            }}catch(e){{
-                                return {{
-                                    success: false,
-                                    message: e.message
-                                }};
-                            }}
-                        }}"""
-                    )
+                    # 2. Navigate directly to auth state URL (browser handles WAF challenges)
+                    auth_state_url = self.provider_config.get_auth_state_url()
+                    print(f"ℹ️ {self.account_name}: Navigating to auth state URL: {auth_state_url}")
+                    api_response = await page.goto(auth_state_url, wait_until="networkidle")
+
+                    # Check if we got a JSON response or an HTML WAF challenge
+                    content_type = api_response.headers.get("content-type", "") if api_response else ""
+                    body_text = await page.evaluate("() => document.body.innerText")
+
+                    if "application/json" not in content_type:
+                        # Got HTML (likely WAF challenge page), wait for it to auto-resolve
+                        print(f"ℹ️ {self.account_name}: Got HTML response from auth state URL, waiting for WAF challenge to resolve")
+                        await page.wait_for_timeout(5000)
+
+                        # Check for aliyun captcha on the WAF page
+                        if self.provider_config.aliyun_captcha:
+                            captcha_check = await aliyun_captcha_check(page, self.account_name)
+                            if captcha_check:
+                                await page.wait_for_timeout(3000)
+
+                        # Retry: navigate to auth state URL again
+                        print(f"ℹ️ {self.account_name}: Retrying auth state URL after WAF challenge")
+                        api_response = await page.goto(auth_state_url, wait_until="networkidle")
+                        body_text = await page.evaluate("() => document.body.innerText")
+
+                    # Parse JSON response
+                    try:
+                        response = json.loads(body_text)
+                    except json.JSONDecodeError as e:
+                        print(f"❌ {self.account_name}: Failed to parse auth state response as JSON: {e}")
+                        await take_screenshot(page, "auth_state_json_error", self.account_name)
+                        return {"success": False, "error": f"Failed to parse auth state response: {e}"}
 
                     if response and "data" in response:
                         cookies = await browser.cookies()
