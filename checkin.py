@@ -14,7 +14,7 @@ from urllib.parse import urlparse, urlencode
 from curl_cffi import requests as curl_requests
 from camoufox.async_api import AsyncCamoufox
 from utils.config import AccountConfig, ProviderConfig
-from utils.browser_utils import parse_cookies, filter_cookies, get_random_user_agent, take_screenshot, aliyun_captcha_check
+from utils.browser_utils import parse_cookies, get_random_user_agent, take_screenshot, aliyun_captcha_check
 from utils.get_cf_clearance import get_cf_clearance
 from utils.http_utils import proxy_resolve, response_resolve
 from utils.topup import topup
@@ -424,7 +424,11 @@ class CheckIn:
     async def get_auth_state_with_browser(self) -> dict:
         """使用 Camoufox 浏览器绕过 WAF 后获取认证状态
 
-        流程：浏览器访问登录页 → 通过 WAF/验证码 → 在页面内 fetch auth state API
+        流程：
+        1. 浏览器直接访问 auth state API URL → 触发 WAF 挑战
+        2. 等待 WAF JS 执行完成（acw_sc__v2 cookie 出现）
+        3. 处理阿里云滑块验证码（如有）
+        4. WAF 通过后，用 fetch() 获取 auth state
 
         Returns:
             包含 success、state、cookies 或 error 的字典
@@ -449,25 +453,40 @@ class CheckIn:
                 page = await browser.new_page()
 
                 try:
-                    # 1. 浏览器访问登录页，触发并通过 WAF
-                    print(f"ℹ️ {self.account_name}: Opening login page to pass WAF")
-                    await page.goto(self.provider_config.get_login_url(), wait_until="networkidle")
+                    auth_state_url = self.provider_config.get_auth_state_url()
 
-                    try:
-                        await page.wait_for_function('document.readyState === "complete"', timeout=5000)
-                    except Exception:
-                        await page.wait_for_timeout(3000)
+                    # 1. 浏览器直接访问 auth state API URL，触发 WAF 挑战
+                    # 登录页是 CDN SPA 不触发 WAF，只有 API 端点才会触发
+                    print(f"ℹ️ {self.account_name}: Navigating to auth state URL to trigger WAF: {auth_state_url}")
+                    await page.goto(auth_state_url, wait_until="networkidle")
 
+                    # 2. 等待 WAF JS 挑战自动解决（acw_sc__v2 cookie 出现表示通过）
+                    print(f"ℹ️ {self.account_name}: Waiting for WAF challenge to resolve...")
+                    waf_resolved = False
+                    for i in range(30):  # 最多等 30 秒
+                        cookies = await browser.cookies()
+                        cookie_names = [c.get("name") for c in cookies]
+                        if "acw_sc__v2" in cookie_names:
+                            print(f"✅ {self.account_name}: WAF challenge resolved (acw_sc__v2 cookie obtained, waited {i+1}s)")
+                            waf_resolved = True
+                            break
+                        await page.wait_for_timeout(1000)
+
+                    if not waf_resolved:
+                        # 列出当前所有 cookies 用于调试
+                        cookies = await browser.cookies()
+                        cookie_names = [c.get("name") for c in cookies]
+                        print(f"⚠️ {self.account_name}: WAF challenge timeout, cookies: {cookie_names}")
+
+                    # 3. 处理阿里云滑块验证码（如有）
                     if self.provider_config.aliyun_captcha:
                         captcha_check = await aliyun_captcha_check(page, self.account_name)
                         if captcha_check:
                             await page.wait_for_timeout(3000)
 
-                    # 2. 在页面内使用 fetch 请求 auth state（与上游项目一致）
-                    # fetch 是同源请求，自动携带 WAF cookies，无指纹不匹配风险
-                    auth_state_url = self.provider_config.get_auth_state_url()
-                    print(f"ℹ️ {self.account_name}: Fetching auth state from page context: {auth_state_url}")
-
+                    # 4. WAF 通过后，在页面上下文中 fetch auth state
+                    # 此时浏览器已有完整 WAF cookies（acw_tc + acw_sc__v2）
+                    print(f"ℹ️ {self.account_name}: Fetching auth state from page context")
                     response = await page.evaluate(
                         f"""async () => {{
                             try {{
@@ -492,65 +511,17 @@ class CheckIn:
                             "cookies": cookies,
                         }
 
-                    # fetch 失败，尝试 curl_cffi 回退
+                    # fetch 仍然失败，记录错误
                     fetch_error = response.get("message", "No data in response") if response else "No response"
-                    print(
-                        f"⚠️ {self.account_name}: Browser fetch failed ({fetch_error}), "
-                        f"trying curl_cffi fallback with browser cookies"
-                    )
+                    print(f"❌ {self.account_name}: Browser fetch failed after WAF bypass: {fetch_error}")
+                    await take_screenshot(page, "auth_state_fetch_failed", self.account_name)
 
-                    browser_cookies = await browser.cookies()
-                    cookie_dict = filter_cookies(browser_cookies, self.provider_config.origin)
+                    # 列出当前 cookies 帮助调试
+                    all_cookies = await browser.cookies()
+                    cookie_info = [f"{c.get('name')}({c.get('domain')})" for c in all_cookies]
+                    print(f"ℹ️ {self.account_name}: Current cookies: {', '.join(cookie_info)}")
 
-                    if not cookie_dict:
-                        await take_screenshot(page, "no_waf_cookies", self.account_name)
-                        return {"success": False, "error": f"Browser fetch failed: {fetch_error}, no cookies for fallback"}
-
-                    # 获取浏览器实际的 User-Agent 保持指纹一致
-                    browser_ua = await page.evaluate("() => navigator.userAgent")
-                    impersonate = get_curl_cffi_impersonate(browser_ua)
-                    session = curl_requests.Session(impersonate=impersonate)
-
-                    headers = {
-                        "Accept": "application/json, text/plain, */*",
-                        "Accept-Language": "en,en-US;q=0.9,zh;q=0.8,en-CN;q=0.7,zh-CN;q=0.6",
-                        "Cache-Control": "no-store",
-                        "Pragma": "no-cache",
-                        "User-Agent": browser_ua,
-                        "Referer": self.provider_config.get_login_url(),
-                        "Origin": self.provider_config.origin,
-                        "sec-fetch-dest": "empty",
-                        "sec-fetch-mode": "cors",
-                        "sec-fetch-site": "same-origin",
-                    }
-
-                    proxy_url = proxy_resolve(self.camoufox_proxy_config)
-
-                    http_response = session.get(
-                        auth_state_url,
-                        headers=headers,
-                        cookies=cookie_dict,
-                        proxies={"https": proxy_url, "http": proxy_url} if proxy_url else None,
-                        timeout=30,
-                    )
-
-                    print(
-                        f"ℹ️ {self.account_name}: curl_cffi fallback response: "
-                        f"HTTP {http_response.status_code}, Content-Type: {http_response.headers.get('content-type', 'N/A')}"
-                    )
-
-                    if http_response.status_code == 200:
-                        json_data = response_resolve(http_response, "get_auth_state_browser", self.account_name)
-                        if json_data and json_data.get("success"):
-                            return {
-                                "success": True,
-                                "state": json_data.get("data"),
-                                "cookies": browser_cookies,
-                            }
-                        error_msg = json_data.get("message", "Invalid response") if json_data else "Non-JSON response"
-                        return {"success": False, "error": f"curl_cffi fallback failed: {error_msg}"}
-                    else:
-                        return {"success": False, "error": f"curl_cffi fallback HTTP {http_response.status_code}"}
+                    return {"success": False, "error": f"Browser fetch failed: {fetch_error}"}
 
                 except Exception as e:
                     print(f"❌ {self.account_name}: Failed to get state, {e}")
