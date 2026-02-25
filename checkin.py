@@ -14,7 +14,7 @@ from urllib.parse import urlparse, urlencode
 from curl_cffi import requests as curl_requests
 from camoufox.async_api import AsyncCamoufox
 from utils.config import AccountConfig, ProviderConfig
-from utils.browser_utils import parse_cookies, get_random_user_agent, take_screenshot, aliyun_captcha_check
+from utils.browser_utils import parse_cookies, filter_cookies, get_random_user_agent, take_screenshot, aliyun_captcha_check
 from utils.get_cf_clearance import get_cf_clearance
 from utils.http_utils import proxy_resolve, response_resolve
 from utils.topup import topup
@@ -422,17 +422,16 @@ class CheckIn:
             }
 
     async def get_auth_state_with_browser(self) -> dict:
-        """使用 Camoufox 获取认证 URL 和 cookies
+        """使用 Camoufox 浏览器绕过 WAF 后，通过 curl_cffi 获取认证状态
 
-        Args:
-            status: 要存储到 localStorage 的状态数据
-            wait_for_url: 要等待的 URL 模式
+        流程：浏览器访问登录页 → 通过 WAF/验证码 → 提取 cookies → curl_cffi 请求 auth state API
 
         Returns:
-            包含 success、url、cookies 或 error 的字典
+            包含 success、state、cookies 或 error 的字典
         """
         print(
-            f"ℹ️ {self.account_name}: Starting browser to get auth state (using proxy: {'true' if self.camoufox_proxy_config else 'false'})"
+            f"ℹ️ {self.account_name}: Starting browser to bypass WAF for auth state "
+            f"(using proxy: {'true' if self.camoufox_proxy_config else 'false'})"
         )
 
         with tempfile.TemporaryDirectory(prefix=f"camoufox_{self.safe_account_name}_auth_") as tmp_dir:
@@ -450,11 +449,10 @@ class CheckIn:
                 page = await browser.new_page()
 
                 try:
-                    # 1. Open the login page first
-                    print(f"ℹ️ {self.account_name}: Opening login page")
+                    # 1. 浏览器访问登录页，触发并通过 WAF
+                    print(f"ℹ️ {self.account_name}: Opening login page to pass WAF")
                     await page.goto(self.provider_config.get_login_url(), wait_until="networkidle")
 
-                    # Wait for page to be fully loaded
                     try:
                         await page.wait_for_function('document.readyState === "complete"', timeout=5000)
                     except Exception:
@@ -465,53 +463,79 @@ class CheckIn:
                         if captcha_check:
                             await page.wait_for_timeout(3000)
 
-                    # 2. Navigate directly to auth state URL (browser handles WAF challenges)
+                    # 2. 提取浏览器 cookies（包含 WAF 通行 cookies）
+                    browser_cookies = await browser.cookies()
+                    cookie_dict = filter_cookies(browser_cookies, self.provider_config.origin)
+
+                    if not cookie_dict:
+                        print(f"⚠️ {self.account_name}: No matching cookies found after WAF bypass")
+                        await take_screenshot(page, "no_waf_cookies", self.account_name)
+                        return {"success": False, "error": "No cookies obtained from browser WAF bypass"}
+
+                    print(
+                        f"ℹ️ {self.account_name}: Got {len(cookie_dict)} cookies from browser, "
+                        f"using curl_cffi for auth state request"
+                    )
+
+                    # 3. 使用 curl_cffi 携带 WAF cookies 请求 auth state API
                     auth_state_url = self.provider_config.get_auth_state_url()
-                    print(f"ℹ️ {self.account_name}: Navigating to auth state URL: {auth_state_url}")
-                    api_response = await page.goto(auth_state_url, wait_until="networkidle")
+                    impersonate = get_curl_cffi_impersonate()
+                    session = curl_requests.Session(impersonate=impersonate)
 
-                    # Check if we got a JSON response or an HTML WAF challenge
-                    content_type = api_response.headers.get("content-type", "") if api_response else ""
-                    body_text = await api_response.text() if api_response else ""
+                    headers = {
+                        "Accept": "application/json, text/plain, */*",
+                        "Accept-Language": "en,en-US;q=0.9,zh;q=0.8,en-CN;q=0.7,zh-CN;q=0.6",
+                        "Cache-Control": "no-store",
+                        "Pragma": "no-cache",
+                        "User-Agent": get_random_user_agent(),
+                        "Referer": self.provider_config.get_login_url(),
+                        "Origin": self.provider_config.origin,
+                        "sec-fetch-dest": "empty",
+                        "sec-fetch-mode": "cors",
+                        "sec-fetch-site": "same-origin",
+                    }
 
-                    if "application/json" not in content_type:
-                        # Got HTML (likely WAF challenge page), wait for it to auto-resolve
-                        print(f"ℹ️ {self.account_name}: Got HTML response from auth state URL, waiting for WAF challenge to resolve")
-                        await page.wait_for_timeout(5000)
+                    proxy_url = proxy_resolve(self.camoufox_proxy_config)
 
-                        # Check for aliyun captcha on the WAF page
-                        if self.provider_config.aliyun_captcha:
-                            captcha_check = await aliyun_captcha_check(page, self.account_name)
-                            if captcha_check:
-                                await page.wait_for_timeout(3000)
+                    response = session.get(
+                        auth_state_url,
+                        headers=headers,
+                        cookies=cookie_dict,
+                        proxies={"https": proxy_url, "http": proxy_url} if proxy_url else None,
+                        timeout=30,
+                    )
 
-                        # Retry: navigate to auth state URL again
-                        print(f"ℹ️ {self.account_name}: Retrying auth state URL after WAF challenge")
-                        api_response = await page.goto(auth_state_url, wait_until="networkidle")
-                        body_text = await api_response.text() if api_response else ""
+                    print(
+                        f"ℹ️ {self.account_name}: Auth state response: "
+                        f"HTTP {response.status_code}, Content-Type: {response.headers.get('content-type', 'N/A')}"
+                    )
 
-                    # Parse JSON response
-                    try:
-                        response = json.loads(body_text)
-                    except json.JSONDecodeError as e:
-                        print(f"❌ {self.account_name}: Failed to parse auth state response as JSON: {e}")
-                        await take_screenshot(page, "auth_state_json_error", self.account_name)
-                        return {"success": False, "error": f"Failed to parse auth state response: {e}"}
+                    if response.status_code == 200:
+                        json_data = response_resolve(response, "get_auth_state_browser", self.account_name)
+                        if json_data is None:
+                            return {
+                                "success": False,
+                                "error": "Failed to get auth state: Invalid response (HTML/non-JSON)",
+                            }
 
-                    if response and "data" in response:
-                        cookies = await browser.cookies()
-                        return {
-                            "success": True,
-                            "state": response.get("data"),
-                            "cookies": cookies,
-                        }
-
-                    return {"success": False, "error": f"Failed to get state, \n{json.dumps(response, indent=2)}"}
+                        if json_data.get("success"):
+                            auth_data = json_data.get("data")
+                            # 返回浏览器 cookies（Camoufox 格式），用于后续 OAuth 流程中设置浏览器上下文
+                            return {
+                                "success": True,
+                                "state": auth_data,
+                                "cookies": browser_cookies,
+                            }
+                        else:
+                            error_msg = json_data.get("message", "Unknown error")
+                            return {"success": False, "error": f"Auth state API error: {error_msg}"}
+                    else:
+                        return {"success": False, "error": f"Auth state request returned HTTP {response.status_code}"}
 
                 except Exception as e:
                     print(f"❌ {self.account_name}: Failed to get state, {e}")
                     await take_screenshot(page, "auth_url_error", self.account_name)
-                    return {"success": False, "error": "Failed to get state"}
+                    return {"success": False, "error": f"Failed to get state: {e}"}
                 finally:
                     await page.close()
 
