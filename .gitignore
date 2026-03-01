@@ -12,3 +12,4 @@ balance_hash_*.txt
 linuxdo_reads
 accounts_*.json
 .ipynb_checkpoints/checkin-checkpoint.py
+tests/.ipynb_checkpoints/test_auth_state_fallback-checkpoint.py

@@ -294,8 +294,6 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
             # 页面异步渲染，稍作等待
             await page.wait_for_timeout(3000)
 
-        slider = None
-        slider_selector = None
         slider_selectors = [
             "#nocaptcha .nc_scale",
             "#aliyunCaptcha-sliding-slider",
@@ -303,17 +301,6 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
             "[id*='sliding-slider']",
         ]
 
-        for selector in slider_selectors:
-            element = await page.query_selector(selector)
-            if element:
-                box = await element.bounding_box()
-                if box:
-                    slider = box
-                    slider_selector = selector
-                    break
-
-        handle = None
-        handle_selector = None
         handle_selectors = [
             "#nocaptcha .btn_slide",
             ".btn_slide",
@@ -324,69 +311,88 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
             "#aliyunCaptcha-sliding-slider + *",
         ]
 
-        for selector in handle_selectors:
-            element = await page.query_selector(selector)
-            if element:
-                box = await element.bounding_box()
-                if box:
-                    handle = box
-                    handle_selector = selector
-                    break
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            slider = None
+            slider_selector = None
+            for selector in slider_selectors:
+                element = await page.query_selector(selector)
+                if element:
+                    box = await element.bounding_box()
+                    if box:
+                        slider = box
+                        slider_selector = selector
+                        break
 
-        if slider and handle:
-            # 规范化：handle 应该是较窄的滑块，slider 应该是较宽的轨道
-            # 某些页面选择器会反过来命中（例如 #aliyunCaptcha-sliding-slider + *）
-            slider_width = slider.get("width", 0)
-            handle_width = handle.get("width", 0)
-            if handle_width > slider_width:
-                slider, handle = handle, slider
-                slider_selector, handle_selector = handle_selector, slider_selector
+            handle = None
+            handle_selector = None
+            for selector in handle_selectors:
+                element = await page.query_selector(selector)
+                if element:
+                    box = await element.bounding_box()
+                    if box:
+                        handle = box
+                        handle_selector = selector
+                        break
 
-            print(f"ℹ️ {account_name}: Slider selector: {slider_selector}, box: {slider}")
-            print(f"ℹ️ {account_name}: Handle selector: {handle_selector}, box: {handle}")
-            await take_screenshot(page, "aliyun_captcha_slider_start", account_name)
+            if slider and handle:
+                # 规范化：handle 应该是较窄的滑块，slider 应该是较宽的轨道
+                # 某些页面选择器会反过来命中（例如 #aliyunCaptcha-sliding-slider + *）
+                slider_width = slider.get("width", 0)
+                handle_width = handle.get("width", 0)
+                if handle_width > slider_width:
+                    slider, handle = handle, slider
+                    slider_selector, handle_selector = handle_selector, slider_selector
 
-            start_x = handle.get("x") + handle.get("width") / 2
-            start_y = handle.get("y") + handle.get("height") / 2
-            # 目标点设为轨道右端减去滑块半宽，避免拖过头
-            target_x = slider.get("x") + slider.get("width") - handle.get("width") / 2 - 2
+                print(f"ℹ️ {account_name}: [attempt {attempt}/{max_attempts}] Slider selector: {slider_selector}, box: {slider}")
+                print(f"ℹ️ {account_name}: [attempt {attempt}/{max_attempts}] Handle selector: {handle_selector}, box: {handle}")
+                await take_screenshot(page, "aliyun_captcha_slider_start", account_name)
 
-            await page.mouse.move(start_x, start_y)
-            await page.mouse.down()
-            await page.mouse.move(target_x, start_y, steps=40)
-            await page.wait_for_timeout(500)
-            await page.mouse.up()
+                start_x = handle.get("x") + handle.get("width") / 2
+                start_y = handle.get("y") + handle.get("height") / 2
+                # 目标点设为轨道右端减去滑块半宽，避免拖过头
+                target_x = slider.get("x") + slider.get("width") - handle.get("width") / 2 - 2
 
-            await take_screenshot(page, "aliyun_captcha_slider_completed", account_name)
+                await page.mouse.move(start_x, start_y)
+                await page.mouse.down()
+                await page.mouse.move(target_x, start_y, steps=40)
+                await page.wait_for_timeout(500)
+                await page.mouse.up()
 
-            # 等待验证结果生效
-            await page.wait_for_timeout(10000)
-            await take_screenshot(page, "aliyun_captcha_slider_result", account_name)
-        else:
-            # 新版阿里云验证码通常不暴露可拖拽 DOM，尝试直接等待/点击触发一次交互后再检测
-            print(f"⚠️ {account_name}: Slider or handle not found, trying soft interaction fallback")
-            try:
-                await page.mouse.move(360, 420)
-                await page.mouse.click(360, 420)
-                await page.wait_for_timeout(8000)
-            except Exception as e:
-                print(f"⚠️ {account_name}: Soft interaction fallback failed: {e}")
+                await take_screenshot(page, "aliyun_captcha_slider_completed", account_name)
+                await page.wait_for_timeout(10000)
+                await take_screenshot(page, "aliyun_captcha_slider_result", account_name)
+            else:
+                # 新版阿里云验证码通常不暴露可拖拽 DOM，尝试直接等待/点击触发一次交互后再检测
+                print(f"⚠️ {account_name}: [attempt {attempt}/{max_attempts}] Slider or handle not found, trying soft interaction fallback")
+                try:
+                    await page.mouse.move(360, 420)
+                    await page.mouse.click(360, 420)
+                    await page.wait_for_timeout(8000)
+                except Exception as e:
+                    print(f"⚠️ {account_name}: Soft interaction fallback failed: {e}")
+                await take_screenshot(page, "aliyun_captcha_error", account_name)
 
-            await take_screenshot(page, "aliyun_captcha_error", account_name)
+            post_state = await _detect_waf_state()
+            post_has_waf_meta = post_state.get("has_waf_meta", False)
+            post_traceid = post_state.get("traceid")
+            post_has_captcha_container = post_state.get("has_captcha_container", False)
+            print(
+                f"ℹ️ {account_name}: [attempt {attempt}/{max_attempts}] Post-check "
+                f"has_waf_meta={post_has_waf_meta}, traceid={post_traceid if post_traceid else 'N/A'}, "
+                f"has_captcha_container={post_has_captcha_container}"
+            )
 
-        # 无论是否找到 slider，都在末尾重新检测一次页面状态
-        post_state = await _detect_waf_state()
-        post_has_waf_meta = post_state.get("has_waf_meta", False)
-        post_traceid = post_state.get("traceid")
-        post_has_captcha_container = post_state.get("has_captcha_container", False)
+            if not post_has_waf_meta and not post_traceid and not post_has_captcha_container:
+                print(f"✅ {account_name}: Aliyun captcha verification passed")
+                return True
 
-        if not post_has_waf_meta and not post_traceid and not post_has_captcha_container:
-            print(f"✅ {account_name}: Aliyun captcha verification passed")
-            return True
-
+        # 重试后仍失败
+        final_state = await _detect_waf_state()
+        final_traceid = final_state.get("traceid")
         print(
-            f"❌ {account_name}: Aliyun captcha still present"
-            f" (traceid: {post_traceid if post_traceid else 'N/A'})"
+            f"❌ {account_name}: Aliyun captcha still present after {max_attempts} attempts"
+            f" (traceid: {final_traceid if final_traceid else 'N/A'})"
         )
         return False
 

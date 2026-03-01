@@ -439,16 +439,12 @@ class CheckIn:
                 "error": f"Failed to get client id, {e}",
             }
 
-    async def get_auth_state_with_browser(self) -> dict:
-        """使用 Camoufox 获取认证 URL 和 cookies
-
-        Args:
-            status: 要存储到 localStorage 的状态数据
-            wait_for_url: 要等待的 URL 模式
-
-        Returns:
-            包含 success、url、cookies 或 error 的字典
-        """
+    async def get_auth_state_with_browser(
+        self,
+        api_user_key: str,
+        api_user_value: str,
+    ) -> dict:
+        """使用 Camoufox 获取认证状态并提取 cookies。"""
         print(
             f"ℹ️ {self.account_name}: Starting browser to get auth state (using proxy: {'true' if self.camoufox_proxy_config else 'false'})"
         )
@@ -468,11 +464,9 @@ class CheckIn:
                 page = await browser.new_page()
 
                 try:
-                    # 1. Open the login page first
                     print(f"ℹ️ {self.account_name}: Opening login page")
                     await page.goto(self.provider_config.get_login_url(), wait_until="networkidle")
 
-                    # Wait for page to be fully loaded
                     try:
                         await page.wait_for_function('document.readyState === "complete"', timeout=5000)
                     except Exception:
@@ -483,39 +477,54 @@ class CheckIn:
                         if captcha_check:
                             await page.wait_for_timeout(3000)
 
-                    response = await page.evaluate(
-                        f"""async () => {{
-                            try{{
-                                const response = await fetch('{self.provider_config.get_auth_state_url()}', {{
-                                    method: 'GET',
-                                    credentials: 'include',
-                                    headers: {{
-                                        'Accept': 'application/json, text/plain, */*',
-                                        'X-Requested-With': 'XMLHttpRequest'
+                    async def _fetch_auth_state() -> dict:
+                        return await page.evaluate(
+                            f"""async (params) => {{
+                                try{{
+                                    const response = await fetch('{self.provider_config.get_auth_state_url()}', {{
+                                        method: 'GET',
+                                        credentials: 'include',
+                                        headers: {{
+                                            'Accept': 'application/json, text/plain, */*',
+                                            'X-Requested-With': 'XMLHttpRequest',
+                                            [params.apiUserKey]: params.apiUserValue,
+                                        }}
+                                    }});
+
+                                    const ct = response.headers.get('content-type') || '';
+                                    if (ct.includes('application/json')) {{
+                                        const data = await response.json();
+                                        return data;
                                     }}
-                                }});
 
-                                const ct = response.headers.get('content-type') || '';
-                                if (ct.includes('application/json')) {{
-                                    const data = await response.json();
-                                    return data;
+                                    const text = await response.text();
+                                    return {{
+                                        success: false,
+                                        message: 'Non-JSON response',
+                                        status: response.status,
+                                        content_type: ct,
+                                        body_preview: (text || '').slice(0, 500),
+                                    }};
+                                }}catch(e){{
+                                    return {{
+                                        success: false,
+                                        message: e.message
+                                    }};
                                 }}
+                            }}""",
+                            {
+                                "apiUserKey": api_user_key,
+                                "apiUserValue": api_user_value,
+                            },
+                        )
 
-                                const text = await response.text();
-                                return {{
-                                    success: false,
-                                    message: 'Non-JSON response',
-                                    status: response.status,
-                                    html: text
-                                }};
-                            }}catch(e){{
-                                return {{
-                                    success: false,
-                                    message: e.message
-                                }};
-                            }}
-                        }}"""
-                    )
+                    response = await _fetch_auth_state()
+                    if response and "data" not in response and self.provider_config.aliyun_captcha:
+                        print(f"⚠️ {self.account_name}: Browser auth state non-JSON, retry once after captcha check")
+                        captcha_check = await aliyun_captcha_check(page, self.account_name)
+                        if captcha_check:
+                            await page.wait_for_timeout(3000)
+                        response = await _fetch_auth_state()
 
                     if response and "data" in response:
                         cookies = await browser.cookies()
@@ -525,7 +534,17 @@ class CheckIn:
                             "cookies": cookies,
                         }
 
-                    return {"success": False, "error": f"Failed to get state, \n{json.dumps(response, indent=2)}"}
+                    status = response.get("status") if isinstance(response, dict) else None
+                    content_type = response.get("content_type") if isinstance(response, dict) else None
+                    body_preview = response.get("body_preview") if isinstance(response, dict) else None
+                    msg = response.get("message", "Unknown browser auth-state error") if isinstance(response, dict) else "Invalid browser response"
+                    return {
+                        "success": False,
+                        "error": f"Failed to get state: {msg}",
+                        "status": status,
+                        "content_type": content_type,
+                        "body_preview": body_preview,
+                    }
 
                 except Exception as e:
                     print(f"❌ {self.account_name}: Failed to get state, {e}")
@@ -560,14 +579,27 @@ class CheckIn:
                     # HTTP 请求被 WAF 拦截时，回退到浏览器直接获取 auth state
                     print(f"⚠️ {self.account_name}: HTTP auth state blocked/invalid, retrying with browser context")
                     try:
-                        browser_state = await self.get_auth_state_with_browser()
+                        browser_state = await self.get_auth_state_with_browser(
+                            api_user_key=self.provider_config.api_user_key,
+                            api_user_value=str(headers.get(self.provider_config.api_user_key, "-1")),
+                        )
                         if browser_state and browser_state.get("success"):
                             return browser_state
                         else:
                             browser_error = browser_state.get("error", "Unknown browser auth state error") if browser_state else "No browser result"
+                            status = browser_state.get("status") if isinstance(browser_state, dict) else None
+                            content_type = browser_state.get("content_type") if isinstance(browser_state, dict) else None
+                            body_preview = browser_state.get("body_preview") if isinstance(browser_state, dict) else None
+                            detail = f"http_non_json_then_browser_non_json: {browser_error}"
+                            if status is not None:
+                                detail += f", status={status}"
+                            if content_type:
+                                detail += f", content_type={content_type}"
+                            if body_preview:
+                                detail += f", body_preview={body_preview}"
                             return {
                                 "success": False,
-                                "error": f"Failed to get auth state: {browser_error}",
+                                "error": f"Failed to get auth state: {detail}",
                             }
                     except Exception as browser_err:
                         return {
