@@ -92,6 +92,9 @@ class CheckIn:
                         captcha_check = await aliyun_captcha_check(page, self.account_name)
                         if captcha_check:
                             await page.wait_for_timeout(3000)
+                        else:
+                            print(f"❌ {self.account_name}: Aliyun captcha not passed, cannot obtain valid WAF cookies")
+                            return None
 
                     # 保存浏览器指纹头，后续 API 请求复用，降低 WAF 误判
                     try:
@@ -113,11 +116,14 @@ class CheckIn:
                         if cookie_name in waf_cookie_names and cookie_value is not None:
                             waf_cookies[cookie_name] = cookie_value
 
-                    # 如果识别到的专用 WAF cookie 过少，则直接回退为域内全部 cookies
-                    # 这样能携带验证页下发的动态 token/csrf/session，提升通过率
-                    effective_cookies = waf_cookies if waf_cookies else filtered_cookies
+                    # 始终携带域内全部 cookies，避免遗漏 WAF 动态字段（例如 _c_WBKFRo）
+                    # 同时保留 waf_cookies 统计日志，便于排查
+                    effective_cookies = filtered_cookies
 
-                    print(f"ℹ️ {self.account_name}: Got {len(effective_cookies)} bypass cookies after step 1")
+                    print(
+                        f"ℹ️ {self.account_name}: Got {len(effective_cookies)} bypass cookies after step 1 "
+                        f"(special_waf={len(waf_cookies)})"
+                    )
 
                     if not effective_cookies:
                         print(f"❌ {self.account_name}: No bypass cookies obtained")
@@ -623,7 +629,12 @@ class CheckIn:
             ) as browser:
                 page = await browser.new_page()
 
-                browser.add_cookies(auth_cookies)
+                if auth_cookies:
+                    try:
+                        await browser.add_cookies(auth_cookies)
+                        print(f"ℹ️ {self.account_name}: Loaded {len(auth_cookies)} cookies into browser context")
+                    except Exception as e:
+                        print(f"⚠️ {self.account_name}: Failed to add auth cookies to browser: {e}")
 
                 try:
                     # 1. 打开登录页面
@@ -642,18 +653,37 @@ class CheckIn:
                             await page.wait_for_timeout(3000)
 
                     # 获取用户信息
+                    # 显式带上 new-api-user 头，保持与 HTTP 路径一致
                     response = await page.evaluate(
-                        f"""async () => {{
+                        f"""async (apiUserKey, apiUserValue) => {{
                            const response = await fetch(
-                               '{self.provider_config.get_user_info_url()}'
+                               '{self.provider_config.get_user_info_url()}',
+                               {{
+                                   method: 'GET',
+                                   credentials: 'include',
+                                   headers: {{
+                                       [apiUserKey]: apiUserValue,
+                                       'Accept': 'application/json, text/plain, */*',
+                                       'X-Requested-With': 'XMLHttpRequest'
+                                   }}
+                               }}
                            );
-                           const data = await response.json();
-                           return data;
-                        }}"""
+
+                           const ct = response.headers.get('content-type') || '';
+                           if (ct.includes('application/json')) {{
+                               const data = await response.json();
+                               return {{ ok: response.ok, status: response.status, data }};
+                           }}
+
+                           const text = await response.text();
+                           return {{ ok: response.ok, status: response.status, html: text }};
+                        }}""",
+                        self.provider_config.api_user_key,
+                        str(self.account_config.api_user or "-1"),
                     )
 
-                    if response and "data" in response:
-                        user_data = response.get("data", {})
+                    if response and "data" in response and response.get("data") and "data" in response.get("data"):
+                        user_data = response.get("data", {}).get("data", {})
                         quota = round(user_data.get("quota", 0) / 500000, 2)
                         used_quota = round(user_data.get("used_quota", 0) / 500000, 2)
                         bonus_quota = round(user_data.get("bonus_quota", 0) / 500000, 2)
@@ -689,20 +719,40 @@ class CheckIn:
             if response.status_code == 200:
                 json_data = response_resolve(response, "get_user_info", self.account_name)
                 if json_data is None:
-                    # 尝试从浏览器获取用户信息
-                    # print(f"ℹ️ {self.account_name}: Getting user info from browser")
-                    # try:
-                    #     user_info_result = await self.get_user_info_with_browser()
-                    #     if user_info_result.get("success"):
-                    #         return user_info_result
-                    #     else:
-                    #         error_msg = user_info_result.get("error", "Unknown error")
-                    #         print(f"⚠️ {self.account_name}: {error_msg}")
-                    # except Exception as browser_err:
-                    #     print(
-                    #         f"⚠️ {self.account_name}: "
-                    #         f"Failed to get user info from browser: {browser_err}"
-                    #     )
+                    # WAF 返回 HTML 时，回退到浏览器上下文重试一次 user_info
+                    print(f"⚠️ {self.account_name}: HTTP user info blocked/invalid, retrying with browser context")
+                    try:
+                        auth_cookies = []
+                        parsed_domain = urlparse(self.provider_config.origin).netloc
+                        for cookie in session.cookies.jar:
+                            # 仅携带目标域相关 cookies
+                            cookie_domain = cookie.domain.lstrip(".") if cookie.domain else parsed_domain
+                            if (
+                                parsed_domain == cookie_domain
+                                or parsed_domain.endswith("." + cookie_domain)
+                                or cookie_domain.endswith("." + parsed_domain)
+                            ):
+                                cookie_dict = {
+                                    "name": cookie.name,
+                                    "domain": cookie.domain if cookie.domain else parsed_domain,
+                                    "value": cookie.value,
+                                    "path": cookie.path if cookie.path else "/",
+                                    "secure": bool(cookie.secure) if cookie.secure is not None else False,
+                                    "httpOnly": bool(cookie._rest.get("HttpOnly", False)) if cookie._rest.get("HttpOnly", False) is not None else False,
+                                    "sameSite": str(cookie._rest.get("SameSite", "Lax")) if cookie._rest.get("SameSite", "Lax") else "Lax",
+                                }
+                                if cookie.expires is not None:
+                                    cookie_dict["expires"] = float(cookie.expires)
+                                auth_cookies.append(cookie_dict)
+
+                        browser_user_info = await self.get_user_info_with_browser(auth_cookies)
+                        if browser_user_info.get("success"):
+                            return browser_user_info
+                        else:
+                            error_msg = browser_user_info.get("error", "Unknown browser fallback error")
+                            print(f"⚠️ {self.account_name}: Browser fallback failed - {error_msg}")
+                    except Exception as browser_err:
+                        print(f"⚠️ {self.account_name}: Browser fallback exception - {browser_err}")
 
                     return {
                         "success": False,
