@@ -14,11 +14,11 @@ from urllib.parse import urlparse, urlencode
 from curl_cffi import requests as curl_requests
 from camoufox.async_api import AsyncCamoufox
 from utils.config import AccountConfig, ProviderConfig
-from utils.browser_utils import parse_cookies, get_random_user_agent, take_screenshot, aliyun_captcha_check
+from utils.browser_utils import parse_cookies, filter_cookies, get_random_user_agent, take_screenshot, aliyun_captcha_check
 from utils.get_cf_clearance import get_cf_clearance
 from utils.http_utils import proxy_resolve, response_resolve
 from utils.topup import topup
-from utils.get_headers import get_curl_cffi_impersonate
+from utils.get_headers import get_curl_cffi_impersonate, get_browser_headers
 from utils.mask_utils import mask_username
 
 class CheckIn:
@@ -54,6 +54,8 @@ class CheckIn:
 
         # storage-states 目录
         self.storage_state_dir = storage_state_dir
+        # WAF 获取阶段提取的浏览器指纹头部
+        self.waf_browser_headers = None
 
         os.makedirs(self.storage_state_dir, exist_ok=True)
 
@@ -91,29 +93,40 @@ class CheckIn:
                         if captcha_check:
                             await page.wait_for_timeout(3000)
 
+                    # 保存浏览器指纹头，后续 API 请求复用，降低 WAF 误判
+                    try:
+                        self.waf_browser_headers = await get_browser_headers(page)
+                    except Exception as e:
+                        print(f"⚠️ {self.account_name}: Failed to capture browser headers for WAF stage: {e}")
+                        self.waf_browser_headers = None
+
                     cookies = await browser.cookies()
 
+                    # 尽可能保留与目标站点相关的全部 cookies，避免仅携带 acw_tc 导致再次被 WAF 拦截
+                    filtered_cookies = filter_cookies(cookies, self.provider_config.origin)
+
+                    # 兼容旧逻辑：优先识别常见 WAF cookies
+                    waf_cookie_names = {"acw_tc", "cdn_sec_tc", "acw_sc__v2", "aliyungf_tc", "aliyungf_waf"}
                     waf_cookies = {}
                     print(f"ℹ️ {self.account_name}: WAF cookies")
-                    for cookie in cookies:
-                        cookie_name = cookie.get("name")
-                        cookie_value = cookie.get("value")
-                        print(f"  📚 Cookie: {cookie_name} (value: {cookie_value})")
-                        if cookie_name in ["acw_tc", "cdn_sec_tc", "acw_sc__v2"] and cookie_value is not None:
+                    for cookie_name, cookie_value in filtered_cookies.items():
+                        if cookie_name in waf_cookie_names and cookie_value is not None:
                             waf_cookies[cookie_name] = cookie_value
 
-                    print(f"ℹ️ {self.account_name}: Got {len(waf_cookies)} WAF cookies after step 1")
+                    # 如果识别到的专用 WAF cookie 过少，则直接回退为域内全部 cookies
+                    # 这样能携带验证页下发的动态 token/csrf/session，提升通过率
+                    effective_cookies = waf_cookies if waf_cookies else filtered_cookies
 
-                    # 检查是否至少获取到一个 WAF cookie
-                    if not waf_cookies:
-                        print(f"❌ {self.account_name}: No WAF cookies obtained")
+                    print(f"ℹ️ {self.account_name}: Got {len(effective_cookies)} bypass cookies after step 1")
+
+                    if not effective_cookies:
+                        print(f"❌ {self.account_name}: No bypass cookies obtained")
                         return None
 
-                    # 显示获取到的 cookies
-                    cookie_names = list(waf_cookies.keys())
-                    print(f"✅ {self.account_name}: Successfully got WAF cookies: {cookie_names}")
+                    cookie_names = list(effective_cookies.keys())
+                    print(f"✅ {self.account_name}: Successfully got bypass cookies: {cookie_names}")
 
-                    return waf_cookies
+                    return effective_cookies
 
                 except Exception as e:
                     print(f"❌ {self.account_name}: Error occurred while getting WAF cookies: {e}")
@@ -256,15 +269,14 @@ class CheckIn:
 
                     cookies = await browser.cookies()
 
+                    # 过滤为 provider 域名相关的 cookies，避免污染
+                    filtered_cookies = filter_cookies(cookies, self.provider_config.origin)
+
                     aliyun_captcha_cookies = {}
                     print(f"ℹ️ {self.account_name}: Aliyun Captcha cookies")
-                    for cookie in cookies:
-                        cookie_name = cookie.get("name")
-                        cookie_value = cookie.get("value")
-                        print(f"  📚 Cookie: {cookie_name} (value: {cookie_value})")
-                        # if cookie_name in ["acw_tc", "cdn_sec_tc", "acw_sc__v2"]
-                        # and cookie_value is not None:
-                        aliyun_captcha_cookies[cookie_name] = cookie_value
+                    for cookie_name, cookie_value in filtered_cookies.items():
+                        if cookie_value is not None:
+                            aliyun_captcha_cookies[cookie_name] = cookie_value
 
                     print(
                         f"ℹ️ {self.account_name}: "
@@ -422,20 +434,17 @@ class CheckIn:
             }
 
     async def get_auth_state_with_browser(self) -> dict:
-        """使用 Camoufox 浏览器绕过 WAF 后获取认证状态
+        """使用 Camoufox 获取认证 URL 和 cookies
 
-        流程：
-        1. 浏览器直接访问 auth state API URL → 触发 WAF 挑战
-        2. 等待 WAF JS 执行完成（acw_sc__v2 cookie 出现）
-        3. 处理阿里云滑块验证码（如有）
-        4. WAF 通过后，用 fetch() 获取 auth state
+        Args:
+            status: 要存储到 localStorage 的状态数据
+            wait_for_url: 要等待的 URL 模式
 
         Returns:
-            包含 success、state、cookies 或 error 的字典
+            包含 success、url、cookies 或 error 的字典
         """
         print(
-            f"ℹ️ {self.account_name}: Starting browser to bypass WAF for auth state "
-            f"(using proxy: {'true' if self.camoufox_proxy_config else 'false'})"
+            f"ℹ️ {self.account_name}: Starting browser to get auth state (using proxy: {'true' if self.camoufox_proxy_config else 'false'})"
         )
 
         with tempfile.TemporaryDirectory(prefix=f"camoufox_{self.safe_account_name}_auth_") as tmp_dir:
@@ -453,47 +462,28 @@ class CheckIn:
                 page = await browser.new_page()
 
                 try:
-                    auth_state_url = self.provider_config.get_auth_state_url()
+                    # 1. Open the login page first
+                    print(f"ℹ️ {self.account_name}: Opening login page")
+                    await page.goto(self.provider_config.get_login_url(), wait_until="networkidle")
 
-                    # 1. 浏览器直接访问 auth state API URL，触发 WAF 挑战
-                    # 登录页是 CDN SPA 不触发 WAF，只有 API 端点才会触发
-                    print(f"ℹ️ {self.account_name}: Navigating to auth state URL to trigger WAF: {auth_state_url}")
-                    await page.goto(auth_state_url, wait_until="networkidle")
+                    # Wait for page to be fully loaded
+                    try:
+                        await page.wait_for_function('document.readyState === "complete"', timeout=5000)
+                    except Exception:
+                        await page.wait_for_timeout(3000)
 
-                    # 2. 等待 WAF JS 挑战自动解决（acw_sc__v2 cookie 出现表示通过）
-                    print(f"ℹ️ {self.account_name}: Waiting for WAF challenge to resolve...")
-                    waf_resolved = False
-                    for i in range(30):  # 最多等 30 秒
-                        cookies = await browser.cookies()
-                        cookie_names = [c.get("name") for c in cookies]
-                        if "acw_sc__v2" in cookie_names:
-                            print(f"✅ {self.account_name}: WAF challenge resolved (acw_sc__v2 cookie obtained, waited {i+1}s)")
-                            waf_resolved = True
-                            break
-                        await page.wait_for_timeout(1000)
-
-                    if not waf_resolved:
-                        # 列出当前所有 cookies 用于调试
-                        cookies = await browser.cookies()
-                        cookie_names = [c.get("name") for c in cookies]
-                        print(f"⚠️ {self.account_name}: WAF challenge timeout, cookies: {cookie_names}")
-
-                    # 3. 处理阿里云滑块验证码（如有）
                     if self.provider_config.aliyun_captcha:
                         captcha_check = await aliyun_captcha_check(page, self.account_name)
                         if captcha_check:
                             await page.wait_for_timeout(3000)
 
-                    # 4. WAF 通过后，在页面上下文中 fetch auth state
-                    # 此时浏览器已有完整 WAF cookies（acw_tc + acw_sc__v2）
-                    print(f"ℹ️ {self.account_name}: Fetching auth state from page context")
                     response = await page.evaluate(
                         f"""async () => {{
-                            try {{
-                                const response = await fetch('{auth_state_url}');
+                            try{{
+                                const response = await fetch('{self.provider_config.get_auth_state_url()}');
                                 const data = await response.json();
                                 return data;
-                            }} catch(e) {{
+                            }}catch(e){{
                                 return {{
                                     success: false,
                                     message: e.message
@@ -502,31 +492,20 @@ class CheckIn:
                         }}"""
                     )
 
-                    if response and response.get("data"):
+                    if response and "data" in response:
                         cookies = await browser.cookies()
-                        print(f"✅ {self.account_name}: Got auth state via browser fetch")
                         return {
                             "success": True,
                             "state": response.get("data"),
                             "cookies": cookies,
                         }
 
-                    # fetch 仍然失败，记录错误
-                    fetch_error = response.get("message", "No data in response") if response else "No response"
-                    print(f"❌ {self.account_name}: Browser fetch failed after WAF bypass: {fetch_error}")
-                    await take_screenshot(page, "auth_state_fetch_failed", self.account_name)
-
-                    # 列出当前 cookies 帮助调试
-                    all_cookies = await browser.cookies()
-                    cookie_info = [f"{c.get('name')}({c.get('domain')})" for c in all_cookies]
-                    print(f"ℹ️ {self.account_name}: Current cookies: {', '.join(cookie_info)}")
-
-                    return {"success": False, "error": f"Browser fetch failed: {fetch_error}"}
+                    return {"success": False, "error": f"Failed to get state, \n{json.dumps(response, indent=2)}"}
 
                 except Exception as e:
                     print(f"❌ {self.account_name}: Failed to get state, {e}")
                     await take_screenshot(page, "auth_url_error", self.account_name)
-                    return {"success": False, "error": f"Failed to get state: {e}"}
+                    return {"success": False, "error": "Failed to get state"}
                 finally:
                     await page.close()
 
@@ -969,7 +948,7 @@ class CheckIn:
         cookies: dict,
         common_headers: dict,
         api_user: str | int,
-        impersonate: str = "firefox135",
+        impersonate: str | None = None,
     ) -> tuple[bool, dict]:
         """使用已有 cookies 执行签到操作
         
@@ -982,8 +961,15 @@ class CheckIn:
             f"ℹ️ {self.account_name}: Executing check-in with existing cookies (using proxy: {'true' if self.http_proxy_config else 'false'})"
         )
 
+        # 根据 User-Agent 自动推断 impersonate，确保与请求头指纹一致
+        if not impersonate:
+            user_agent = common_headers.get("User-Agent", "")
+            impersonate = get_curl_cffi_impersonate(user_agent)
+
         session = curl_requests.Session(impersonate=impersonate, proxy=self.http_proxy_config, timeout=30)
-        
+        if impersonate:
+            print(f"ℹ️ {self.account_name}: Using curl_cffi Session with impersonate={impersonate}")
+
         try:
             # 打印 cookies 的键和值
             print(f"ℹ️ {self.account_name}: Cookies to be used:")
@@ -1120,11 +1106,6 @@ class CheckIn:
                 session=session,
                 headers=headers,
             )
-            # 直接 HTTP 失败且启用了阿里云验证码时，回退到浏览器方式
-            if not (auth_state_result and auth_state_result.get("success")):
-                if self.provider_config.aliyun_captcha:
-                    print(f"ℹ️ {self.account_name}: Direct auth state request failed, retrying with browser (aliyun captcha)")
-                    auth_state_result = await self.get_auth_state_with_browser()
             if auth_state_result and auth_state_result.get("success"):
                 print(f"ℹ️ {self.account_name}: Got auth state for GitHub: {auth_state_result['state']}")
             else:
@@ -1288,11 +1269,6 @@ class CheckIn:
                 session=session,
                 headers=headers,
             )
-            # 直接 HTTP 失败且启用了阿里云验证码时，回退到浏览器方式
-            if not (auth_state_result and auth_state_result.get("success")):
-                if self.provider_config.aliyun_captcha:
-                    print(f"ℹ️ {self.account_name}: Direct auth state request failed, retrying with browser (aliyun captcha)")
-                    auth_state_result = await self.get_auth_state_with_browser()
             if auth_state_result and auth_state_result.get("success"):
                 print(f"ℹ️ {self.account_name}: Got auth state for Linux.do: {auth_state_result['state']}")
             else:
@@ -1403,7 +1379,9 @@ class CheckIn:
         print(f"\n\n⏳ Starting to process {self.account_name}")
 
         bypass_cookies = {}
-        browser_headers = None  # 浏览器指纹头部信息
+        # 浏览器指纹头部信息（优先使用 WAF 阶段捕获，其次 cf_clearance 阶段捕获）
+        self.waf_browser_headers = None
+        browser_headers = None
         
         if self.provider_config.needs_waf_cookies():
             waf_cookies = await self.get_waf_cookies_with_browser()
@@ -1437,6 +1415,10 @@ class CheckIn:
                 print(f"⚠️ {self.account_name}: Continuing with empty cookies")
         else:
             print(f"ℹ️ {self.account_name}: Bypass not required, using user cookies directly")
+
+        # 优先使用 WAF 阶段捕获到的浏览器指纹，保持与取 cookie 时一致
+        if self.waf_browser_headers and self.waf_browser_headers.get("User-Agent"):
+            browser_headers = self.waf_browser_headers
 
         # 生成公用请求头（只生成一次 User-Agent，整个签到流程保持一致）
         # 注意：Referer 和 Origin 不在这里设置，由各个签到方法根据实际请求动态设置
@@ -1485,6 +1467,9 @@ class CheckIn:
                 "sec-fetch-site": "same-origin",
             }
             print(f"ℹ️ {self.account_name}: Using random User-Agent (generated once)")
+
+        # cookies 认证场景下增加常见 AJAX/导航头，降低被 WAF 当成异常请求的概率
+        common_headers.setdefault("X-Requested-With", "XMLHttpRequest")
 
         # 解析账号配置
         cookies_data = self.account_config.cookies
@@ -1590,5 +1575,3 @@ class CheckIn:
         print(f"\n🎯 {self.account_name}: {successful_count}/{len(results)} authentication methods successful")
 
         return results
-
-   
