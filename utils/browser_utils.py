@@ -201,7 +201,8 @@ async def save_page_content_to_file(
 async def aliyun_captcha_check(page, account_name: str) -> bool:
     """阿里云验证码检查和处理
 
-    检查页面是否有阿里云验证码（通过 traceid 检测），如果有则尝试自动滑动验证
+    检查页面是否有阿里云验证码（通过 waf meta / traceid / renderData 检测），
+    如果有则尝试自动滑动验证。
 
     Args:
         page: Camoufox/Playwright 页面对象
@@ -210,69 +211,166 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
     Returns:
         bool: 验证码处理是否成功（无验证码或验证通过返回 True，验证失败返回 False）
     """
-    # 检查是否有 traceid (阿里云验证码页面)
-    try:
-        traceid = await page.evaluate(
+
+    async def _detect_waf_state() -> dict:
+        """检测当前页面是否为阿里云 WAF 验证页，并提取 traceid。"""
+        return await page.evaluate(
             """() => {
+            const result = {
+                has_waf_meta: !!document.querySelector('meta[name="aliyun_waf_aa"], meta[name="aliyun_waf_bb"]'),
+                has_captcha_container: !!document.querySelector('#nocaptcha, #captcha-element, #h5_captcha-element, .nc-container'),
+                traceid: null,
+            };
+
+            const extractTraceId = (text) => {
+                if (!text) return null;
+                const m = text.match(/TraceID:\\s*([a-f0-9]+)/i);
+                return m ? m[1] : null;
+            };
+
+            // 1) 传统 traceid 容器
             const traceElement = document.getElementById('traceid');
             if (traceElement) {
-                const text = traceElement.innerText || traceElement.textContent;
-                const match = text.match(/TraceID:\\s*([a-f0-9]+)/i);
-                return match ? match[1] : null;
+                result.traceid = extractTraceId(traceElement.innerText || traceElement.textContent);
             }
-            return null;
+
+            // 2) 新版页面用 newTraceid
+            if (!result.traceid) {
+                const newTraceElement = document.getElementById('newTraceid');
+                if (newTraceElement) {
+                    result.traceid = extractTraceId(newTraceElement.innerText || newTraceElement.textContent);
+                }
+            }
+
+            // 3) 从 renderData 中提取 requestInfo.traceid
+            if (!result.traceid) {
+                const renderData = document.getElementById('renderData');
+                if (renderData && renderData.value) {
+                    const marker = 'var requestInfo = ';
+                    const raw = renderData.value;
+                    const idx = raw.indexOf(marker);
+                    if (idx !== -1) {
+                        const jsonText = raw.slice(idx + marker.length).trim().replace(/;\\s*$/, '');
+                        try {
+                            const info = JSON.parse(jsonText);
+                            if (info && info.traceid) {
+                                result.traceid = info.traceid;
+                            }
+                        } catch (e) {
+                            // ignore parse error
+                        }
+                    }
+                }
+            }
+
+            return result;
         }"""
         )
 
-        if traceid:
-            print(f"⚠️ {account_name}: Aliyun captcha detected, traceid: {traceid}")
-            try:
-                await page.wait_for_selector("#nocaptcha", timeout=60000)
+    try:
+        state = await _detect_waf_state()
+        traceid = state.get("traceid")
+        has_waf_meta = state.get("has_waf_meta", False)
+        has_captcha_container = state.get("has_captcha_container", False)
 
-                slider_element = await page.query_selector("#nocaptcha .nc_scale")
-                if slider_element:
-                    slider = await slider_element.bounding_box()
-                    print(f"ℹ️ {account_name}: Slider bounding box: {slider}")
-
-                slider_handle = await page.query_selector("#nocaptcha .btn_slide")
-                if slider_handle:
-                    handle = await slider_handle.bounding_box()
-                    print(f"ℹ️ {account_name}: Slider handle bounding box: {handle}")
-
-                if slider and handle:
-                    await take_screenshot(page, "aliyun_captcha_slider_start", account_name)
-
-                    await page.mouse.move(
-                        handle.get("x") + handle.get("width") / 2,
-                        handle.get("y") + handle.get("height") / 2,
-                    )
-                    await page.mouse.down()
-                    await page.mouse.move(
-                        handle.get("x") + slider.get("width"),
-                        handle.get("y") + handle.get("height") / 2,
-                        steps=2,
-                    )
-                    await page.mouse.up()
-                    await take_screenshot(page, "aliyun_captcha_slider_completed", account_name)
-
-                    # Wait for page to be fully loaded
-                    await page.wait_for_timeout(20000)
-
-                    await take_screenshot(page, "aliyun_captcha_slider_result", account_name)
-                    return True
-                else:
-                    print(f"❌ {account_name}: Slider or handle not found")
-                    await take_screenshot(page, "aliyun_captcha_error", account_name)
-                    return False
-            except Exception as e:
-                print(f"❌ {account_name}: Error occurred while moving slider, {e}")
-                await take_screenshot(page, "aliyun_captcha_error", account_name)
-                return False
-        else:
-            print(f"ℹ️ {account_name}: No traceid found")
-            await take_screenshot(page, "aliyun_captcha_traceid_found", account_name)
+        # 非验证页，直接通过
+        if not has_waf_meta and not traceid and not has_captcha_container:
+            print(f"ℹ️ {account_name}: No aliyun captcha detected")
+            await take_screenshot(page, "aliyun_captcha_not_detected", account_name)
             return True
+
+        print(
+            f"⚠️ {account_name}: Aliyun captcha detected"
+            f" (traceid: {traceid if traceid else 'N/A'})"
+        )
+        await take_screenshot(page, "aliyun_captcha_detected", account_name)
+
+        try:
+            await page.wait_for_selector(
+                "#nocaptcha, #captcha-element, #h5_captcha-element, .nc-container",
+                timeout=20000,
+            )
+        except Exception:
+            # 页面异步渲染，稍作等待
+            await page.wait_for_timeout(3000)
+
+        slider = None
+        slider_selector = None
+        slider_selectors = [
+            "#nocaptcha .nc_scale",
+            "#aliyunCaptcha-sliding-slider",
+            ".nc_scale",
+            "[id*='sliding-slider']",
+        ]
+
+        for selector in slider_selectors:
+            element = await page.query_selector(selector)
+            if element:
+                box = await element.bounding_box()
+                if box:
+                    slider = box
+                    slider_selector = selector
+                    break
+
+        handle = None
+        handle_selector = None
+        handle_selectors = [
+            "#nocaptcha .btn_slide",
+            ".btn_slide",
+            ".nc_iconfont.btn_slide",
+            "[class*='btn_slide']",
+        ]
+
+        for selector in handle_selectors:
+            element = await page.query_selector(selector)
+            if element:
+                box = await element.bounding_box()
+                if box:
+                    handle = box
+                    handle_selector = selector
+                    break
+
+        if slider and handle:
+            print(f"ℹ️ {account_name}: Slider selector: {slider_selector}, box: {slider}")
+            print(f"ℹ️ {account_name}: Handle selector: {handle_selector}, box: {handle}")
+            await take_screenshot(page, "aliyun_captcha_slider_start", account_name)
+
+            start_x = handle.get("x") + handle.get("width") / 2
+            start_y = handle.get("y") + handle.get("height") / 2
+            target_x = slider.get("x") + slider.get("width") - 2
+
+            await page.mouse.move(start_x, start_y)
+            await page.mouse.down()
+            await page.mouse.move(target_x, start_y, steps=30)
+            await page.wait_for_timeout(300)
+            await page.mouse.up()
+
+            await take_screenshot(page, "aliyun_captcha_slider_completed", account_name)
+
+            # 等待验证结果生效
+            await page.wait_for_timeout(10000)
+            await take_screenshot(page, "aliyun_captcha_slider_result", account_name)
+        else:
+            print(f"❌ {account_name}: Slider or handle not found")
+            await take_screenshot(page, "aliyun_captcha_error", account_name)
+
+        # 无论是否找到 slider，都在末尾重新检测一次页面状态
+        post_state = await _detect_waf_state()
+        post_has_waf_meta = post_state.get("has_waf_meta", False)
+        post_traceid = post_state.get("traceid")
+        post_has_captcha_container = post_state.get("has_captcha_container", False)
+
+        if not post_has_waf_meta and not post_traceid and not post_has_captcha_container:
+            print(f"✅ {account_name}: Aliyun captcha verification passed")
+            return True
+
+        print(
+            f"❌ {account_name}: Aliyun captcha still present"
+            f" (traceid: {post_traceid if post_traceid else 'N/A'})"
+        )
+        return False
+
     except Exception as e:
-        print(f"❌ {account_name}: Error occurred while getting traceid, {e}")
+        print(f"❌ {account_name}: Error occurred while processing aliyun captcha, {e}")
         await take_screenshot(page, "aliyun_captcha_error", account_name)
         return False
