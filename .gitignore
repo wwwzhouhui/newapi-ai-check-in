@@ -11,3 +11,4 @@ balance_hash.txt
 balance_hash_*.txt
 linuxdo_reads
 accounts_*.json
+.ipynb_checkpoints/checkin-checkpoint.py

@@ -486,9 +486,28 @@ class CheckIn:
                     response = await page.evaluate(
                         f"""async () => {{
                             try{{
-                                const response = await fetch('{self.provider_config.get_auth_state_url()}');
-                                const data = await response.json();
-                                return data;
+                                const response = await fetch('{self.provider_config.get_auth_state_url()}', {{
+                                    method: 'GET',
+                                    credentials: 'include',
+                                    headers: {{
+                                        'Accept': 'application/json, text/plain, */*',
+                                        'X-Requested-With': 'XMLHttpRequest'
+                                    }}
+                                }});
+
+                                const ct = response.headers.get('content-type') || '';
+                                if (ct.includes('application/json')) {{
+                                    const data = await response.json();
+                                    return data;
+                                }}
+
+                                const text = await response.text();
+                                return {{
+                                    success: false,
+                                    message: 'Non-JSON response',
+                                    status: response.status,
+                                    html: text
+                                }};
                             }}catch(e){{
                                 return {{
                                     success: false,
@@ -538,10 +557,23 @@ class CheckIn:
             if response.status_code == 200:
                 json_data = response_resolve(response, "get_auth_state", self.account_name)
                 if json_data is None:
-                    return {
-                        "success": False,
-                        "error": "Failed to get auth state: Invalid response type (saved to logs)",
-                    }
+                    # HTTP 请求被 WAF 拦截时，回退到浏览器直接获取 auth state
+                    print(f"⚠️ {self.account_name}: HTTP auth state blocked/invalid, retrying with browser context")
+                    try:
+                        browser_state = await self.get_auth_state_with_browser()
+                        if browser_state and browser_state.get("success"):
+                            return browser_state
+                        else:
+                            browser_error = browser_state.get("error", "Unknown browser auth state error") if browser_state else "No browser result"
+                            return {
+                                "success": False,
+                                "error": f"Failed to get auth state: {browser_error}",
+                            }
+                    except Exception as browser_err:
+                        return {
+                            "success": False,
+                            "error": f"Failed to get auth state: browser fallback error, {browser_err}",
+                        }
 
                 # 检查响应是否成功
                 if json_data.get("success"):
@@ -655,7 +687,10 @@ class CheckIn:
                     # 获取用户信息
                     # 显式带上 new-api-user 头，保持与 HTTP 路径一致
                     response = await page.evaluate(
-                        f"""async (apiUserKey, apiUserValue) => {{
+                        f"""async (params) => {{
+                           const apiUserKey = params.apiUserKey;
+                           const apiUserValue = params.apiUserValue;
+
                            const response = await fetch(
                                '{self.provider_config.get_user_info_url()}',
                                {{
@@ -678,8 +713,10 @@ class CheckIn:
                            const text = await response.text();
                            return {{ ok: response.ok, status: response.status, html: text }};
                         }}""",
-                        self.provider_config.api_user_key,
-                        str(self.account_config.api_user or "-1"),
+                        {
+                            "apiUserKey": self.provider_config.api_user_key,
+                            "apiUserValue": str(self.account_config.api_user or "-1"),
+                        },
                     )
 
                     if response and "data" in response and response.get("data") and "data" in response.get("data"):
