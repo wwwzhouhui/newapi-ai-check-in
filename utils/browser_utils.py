@@ -319,6 +319,9 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
             ".btn_slide",
             ".nc_iconfont.btn_slide",
             "[class*='btn_slide']",
+            "span.btn_slide",
+            "div[role='button'][class*='slide']",
+            "#aliyunCaptcha-sliding-slider + *",
         ]
 
         for selector in handle_selectors:
@@ -351,7 +354,15 @@ async def aliyun_captcha_check(page, account_name: str) -> bool:
             await page.wait_for_timeout(10000)
             await take_screenshot(page, "aliyun_captcha_slider_result", account_name)
         else:
-            print(f"❌ {account_name}: Slider or handle not found")
+            # 新版阿里云验证码通常不暴露可拖拽 DOM，尝试直接等待/点击触发一次交互后再检测
+            print(f"⚠️ {account_name}: Slider or handle not found, trying soft interaction fallback")
+            try:
+                await page.mouse.move(360, 420)
+                await page.mouse.click(360, 420)
+                await page.wait_for_timeout(8000)
+            except Exception as e:
+                print(f"⚠️ {account_name}: Soft interaction fallback failed: {e}")
+
             await take_screenshot(page, "aliyun_captcha_error", account_name)
 
         # 无论是否找到 slider，都在末尾重新检测一次页面状态
