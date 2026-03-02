@@ -320,6 +320,51 @@ python3 -m camoufox fetch
 uv run main.py
 ```
 
+## Docker 构建与运行
+
+### 1) 构建镜像
+
+```bash
+# 方式一：直接构建
+docker build -t wwwzhouhui569/newapi-ai-check-in .
+
+# 方式二：带 GITHUB_TOKEN 构建（可提升 GitHub API 速率限制，减少 camoufox fetch 403）
+docker build --build-arg GITHUB_TOKEN=你的PAT -t wwwzhouhui569/newapi-ai-check-in .
+```
+
+> 说明：构建阶段会尝试预下载 camoufox 浏览器；若遇到 GitHub API 限流，会跳过预下载并继续构建。
+
+### 2) 运行容器
+
+先准备 `.env`（可基于 `.env.example` 修改），然后运行：
+
+```bash
+docker run --rm --name newapi-ai-check-in \
+  --env-file .env \
+  -v "$(pwd)/storage-states:/app/storage-states" \
+  -v "$(pwd)/logs:/app/logs" \
+  -v "$(pwd)/screenshots:/app/screenshots" \
+  wwwzhouhui569/newapi-ai-check-in
+```
+
+后台运行：
+
+```bash
+docker run -d --name newapi-ai-check-in \
+  --env-file .env \
+  -v "$(pwd)/storage-states:/app/storage-states" \
+  -v "$(pwd)/logs:/app/logs" \
+  -v "$(pwd)/screenshots:/app/screenshots" \
+  wwwzhouhui569/newapi-ai-check-in
+```
+
+查看日志与停止容器：
+
+```bash
+docker logs -f newapi-ai-check-in
+docker stop newapi-ai-check-in && docker rm newapi-ai-check-in
+```
+
 ## 测试
 
 ```bash
