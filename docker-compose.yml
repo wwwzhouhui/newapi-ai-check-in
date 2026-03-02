@@ -1,0 +1,15 @@
+services:
+  checkin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: newapi-ai-checkin:latest
+    container_name: newapi-ai-checkin
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./storage-states:/app/storage-states
+      - ./balance_hash.txt:/app/balance_hash.txt
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
